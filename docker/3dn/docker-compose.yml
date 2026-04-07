@@ -1,16 +1,8 @@
-version: "3.8"
-
-# ─────────────────────────────────────────────
-#  Hadoop cluster: 1 NameNode + 3 DataNodes
-#  Block size: 128 MB
-#  Replication factor: 3 (data spread across all nodes)
-# ─────────────────────────────────────────────
-
 x-hadoop-env: &hadoop-env
   CORE_CONF_fs_defaultFS: hdfs://namenode:9000
   CORE_CONF_hadoop_http_staticuser_user: root
   HDFS_CONF_dfs_replication: 3
-  HDFS_CONF_dfs_blocksize: 134217728        # 128 MB
+  HDFS_CONF_dfs_blocksize: 134217728
   HDFS_CONF_dfs_namenode_datanode_registration_ip___hostname___check: "false"
   CLUSTER_NAME: lab-cluster
 
@@ -68,6 +60,27 @@ services:
       - "9866:9864"
     volumes:
       - datanode3_data:/hadoop/dfs/data
+
+  spark-client:
+    build:
+      context: ../..
+      dockerfile: docker/spark-client/Dockerfile
+    container_name: spark-client
+    depends_on:
+      - namenode
+      - datanode1
+      - datanode2
+      - datanode3
+    environment:
+      SPARK_DRIVER_MEMORY: 1g
+    volumes:
+      - ../..:/app
+    working_dir: /app
+    command: tail -f /dev/null
+    deploy:
+      resources:
+        limits:
+          memory: 1500m
 
 volumes:
   namenode_data:

@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Generated data
+data/transactions.csv
+
+# Spark & Hadoop output
+results/experiment_results.json
+results/spark_run.log
+results/*.png
+
+# Docker volumes (if accidentally materialized locally)
+hadoop/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter (if notebooks added later)
+.ipynb_checkpoints/
+*.ipynb

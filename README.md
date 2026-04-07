@@ -29,7 +29,7 @@ hadoop-spark-lab/
 │   └── generate_dataset.py       # Creates data/transactions.csv (120k rows)
 ├── spark/
 │   ├── spark_app.py              # Baseline Spark pipeline
-│   └── spark_app_optimized.py   # Optimized: cache + repartition + broadcast
+│   └── spark_app_opti.py   # Optimized: cache + repartition + broadcast
 ├── results/
 │   ├── experiment_results.json   # Written by each spark-submit run
 │   └── compare_results.py        # Produces 4 comparison PNG charts
@@ -65,7 +65,7 @@ spark-submit --master local[*] --driver-memory 1g \
 
 spark-submit --master local[*] --driver-memory 1g \
   --conf spark.driver.extraJavaOptions="-Dlog4j.configuration=file:config/log4j.properties" \
-  spark/spark_app_optimized.py hdfs://localhost:9000 1dn_opt
+  spark/spark_app_opti.py hdfs://localhost:9000 1dn_opt
 
 # 5. Stop cluster, start 3-DN cluster, repeat
 docker compose -f docker/1dn/docker-compose.yml down -v
@@ -106,7 +106,7 @@ the dataset to 1M+ rows or reduce block size to 1 MB
 - Datanode (3-DN setup): 768 MB each (3 × 768 MB = 2.25 GB total)
 - Spark driver + executor: 1 GB each (set in SparkSession config)
 
-## Optimizations in spark_app_optimized.py
+## Optimizations in spark_app_opti.py
 
 | Technique              | Where applied                     | Effect                                |
 |------------------------|-----------------------------------|---------------------------------------|

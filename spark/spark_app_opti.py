@@ -2,11 +2,15 @@
 spark_app_optimized.py  —  Optimized Spark application
 ────────────────────────────────────────────────────────
 Optimizations applied vs. baseline:
-  1. .repartition()    — tune parallelism to cluster size
-  2. .cache()          — persist filtered DF in memory (reused in steps 4 & 5)
-  3. Broadcast join    — small category-metadata table joined without shuffle
-  4. Avoid re-reading  — all downstream ops from cached DF
-  5. Kryo serializer   — faster than Java default
+  1. .cache()          — persist filtered DF in memory (reused in steps 4 & 5)
+  2. Broadcast join    — small category-metadata table joined without shuffle
+  3. Avoid re-reading  — all downstream ops read from cache, not HDFS
+  4. Kryo serializer   — faster than Java default serialization
+  5. AQE               — adaptive query execution auto-coalesces shuffle partitions
+
+  NOTE: .repartition() was intentionally removed. At local[*] with a single
+  CSV input, it triggers a full shuffle whose cost exceeds any parallelism
+  gain at this data scale (~200 MB). AQE handles partition tuning.
 
 Usage:
   spark-submit \
@@ -37,11 +41,6 @@ EXP_LABEL  = sys.argv[2] if len(sys.argv) > 2 else "1dn_opt"
 HDFS_INPUT = f"{HDFS_URL}/data/transactions.csv"
 HDFS_OUT   = f"{HDFS_URL}/output/{EXP_LABEL}"
 RESULTS_FILE = Path("results/experiment_results.json")
-
-# Number of partitions — set to 2× physical cores for local mode.
-# For a real YARN cluster, set to 2-3× number of executor cores.
-import multiprocessing
-N_PARTITIONS = max(4, multiprocessing.cpu_count() * 2)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -81,7 +80,6 @@ def save_results(metrics: dict, total_s: float):
 
 # ── Spark session ─────────────────────────────────────────────────────────────
 log.info(f"Starting OPTIMIZED experiment: {EXP_LABEL}")
-log.info(f"Target partitions: {N_PARTITIONS}")
 
 spark = (
     SparkSession.builder
@@ -90,9 +88,7 @@ spark = (
     .config("spark.executor.memory", "1g")
     # ── Optimization configs ─────────────────────────────────────────────
     .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
-    .config("spark.default.parallelism",          str(N_PARTITIONS))
-    .config("spark.sql.shuffle.partitions",       str(N_PARTITIONS))
-    # Adaptive Query Execution (Spark 3+): auto-coalesces shuffle partitions
+    # AQE handles shuffle partition count automatically — no manual N_PARTITIONS
     .config("spark.sql.adaptive.enabled",         "true")
     .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
     # Broadcast join threshold — tables < 20 MB broadcast automatically
@@ -110,18 +106,21 @@ t_global = time.perf_counter()
 # ═══════════════════════════════════════════════════════════════════════════
 #  STEP 1 — Load + repartition
 # ═══════════════════════════════════════════════════════════════════════════
-log.info("── STEP 1: Load CSV from HDFS + repartition")
+log.info("── STEP 1: Load CSV from HDFS")
 t0 = time.perf_counter()
 
+# No manual repartition — at local[*] the CSV split already gives one partition
+# per HDFS block, and AQE coalesces shuffle partitions automatically.
+# Explicit repartition causes a full shuffle (dominant cost at 2M rows) that
+# exceeds any downstream parallelism gain on a single-machine deployment.
 df_raw = (
     spark.read
     .option("header", "true")
     .option("inferSchema", "true")
     .csv(HDFS_INPUT)
-    .repartition(N_PARTITIONS)   # ← distribute evenly across partitions
 )
 row_count = df_raw.count()
-checkpoint("1_load_repartition", t0, metrics)
+checkpoint("1_load_count", t0, metrics)
 log.info(f"  Rows: {row_count:,}  |  Partitions: {df_raw.rdd.getNumPartitions()}")
 
 # ═══════════════════════════════════════════════════════════════════════════

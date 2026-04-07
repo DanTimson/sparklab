@@ -1,16 +1,8 @@
-version: "3.8"
-
-# ─────────────────────────────────────────────
-#  Hadoop cluster: 1 NameNode + 1 DataNode
-#  Block size: 128 MB (set via hdfs-site.xml env)
-#  Memory limited per container
-# ─────────────────────────────────────────────
-
 x-hadoop-env: &hadoop-env
   CORE_CONF_fs_defaultFS: hdfs://namenode:9000
   CORE_CONF_hadoop_http_staticuser_user: root
   HDFS_CONF_dfs_replication: 1
-  HDFS_CONF_dfs_blocksize: 134217728        # 128 MB
+  HDFS_CONF_dfs_blocksize: 134217728
   HDFS_CONF_dfs_namenode_datanode_registration_ip___hostname___check: "false"
   CLUSTER_NAME: lab-cluster
 
@@ -21,8 +13,8 @@ services:
     container_name: namenode
     restart: unless-stopped
     ports:
-      - "9870:9870"   # Web UI
-      - "9000:9000"   # HDFS RPC
+      - "9870:9870"
+      - "9000:9000"
     environment:
       <<: *hadoop-env
     volumes:
@@ -37,7 +29,7 @@ services:
     container_name: datanode1
     restart: unless-stopped
     ports:
-      - "9864:9864"   # DataNode Web UI
+      - "9864:9864"
     environment:
       <<: *hadoop-env
       SERVICE_PRECONDITION: "namenode:9870"
@@ -49,6 +41,27 @@ services:
       resources:
         limits:
           memory: 1g
+
+  spark-client:
+    build:
+      context: ../..          # project root (for requirements.txt)
+      dockerfile: docker/spark-client/Dockerfile
+    container_name: spark-client
+    depends_on:
+      - namenode
+      - datanode1
+    environment:
+      # Spark driver runs inside Docker — keep memory in check
+      SPARK_DRIVER_MEMORY: 1g
+    volumes:
+      - ../..:/app             # mount full project into /app
+    working_dir: /app
+    # Stay alive so we can docker exec into it
+    command: tail -f /dev/null
+    deploy:
+      resources:
+        limits:
+          memory: 1500m
 
 volumes:
   namenode_data:

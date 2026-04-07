@@ -21,7 +21,8 @@ import pandas as pd
 from pathlib import Path
 
 SEED       = 42
-N_ROWS     = 120_000
+# N_ROWS     = 120_000
+N_ROWS = 2_000_000
 OUTPUT     = Path(__file__).parent / "transactions.csv"
 
 rng = np.random.default_rng(SEED)

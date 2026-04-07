@@ -1,0 +1,55 @@
+version: "3.8"
+
+# ─────────────────────────────────────────────
+#  Hadoop cluster: 1 NameNode + 1 DataNode
+#  Block size: 128 MB (set via hdfs-site.xml env)
+#  Memory limited per container
+# ─────────────────────────────────────────────
+
+x-hadoop-env: &hadoop-env
+  CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+  CORE_CONF_hadoop_http_staticuser_user: root
+  HDFS_CONF_dfs_replication: 1
+  HDFS_CONF_dfs_blocksize: 134217728        # 128 MB
+  HDFS_CONF_dfs_namenode_datanode_registration_ip___hostname___check: "false"
+  CLUSTER_NAME: lab-cluster
+
+services:
+
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    restart: unless-stopped
+    ports:
+      - "9870:9870"   # Web UI
+      - "9000:9000"   # HDFS RPC
+    environment:
+      <<: *hadoop-env
+    volumes:
+      - namenode_data:/hadoop/dfs/name
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  datanode1:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode1
+    restart: unless-stopped
+    ports:
+      - "9864:9864"   # DataNode Web UI
+    environment:
+      <<: *hadoop-env
+      SERVICE_PRECONDITION: "namenode:9870"
+    volumes:
+      - datanode1_data:/hadoop/dfs/data
+    depends_on:
+      - namenode
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+volumes:
+  namenode_data:
+  datanode1_data:

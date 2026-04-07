@@ -1,29 +1,19 @@
 """
-generate_dataset.py
-───────────────────
 Generates a synthetic e-commerce transactions dataset.
 
-Schema (8 features, 3 types):
-  user_id        int       unique customer identifier
-  product_id     int       product SKU
-  quantity       int       units ordered (1–20)
-  price          float     unit price (USD)
-  discount       float     discount fraction (0.0–0.5)
-  category       string    product category  ← categorical
-  payment_method string    payment type      ← categorical
-  region         string    sales region      ← categorical
-
-Output: data/transactions.csv  (~100 000 rows, ~12 MB)
+Usage:
+  python generate_dataset.py [N_ROWS]   (default: 120_000)
+  python generate_dataset.py 1000000
 """
 
+import sys
 import numpy as np
 import pandas as pd
 from pathlib import Path
 
-SEED       = 42
-# N_ROWS     = 120_000
-N_ROWS = 2_000_000
-OUTPUT     = Path(__file__).parent / "transactions.csv"
+SEED   = 42
+N_ROWS = int(sys.argv[1]) if len(sys.argv) > 1 else 120_000
+OUTPUT = Path(__file__).parent / "transactions.csv"
 
 rng = np.random.default_rng(SEED)
 
@@ -32,7 +22,6 @@ CATEGORIES      = ["Electronics", "Clothing", "Books", "Home & Garden",
 PAYMENT_METHODS = ["credit_card", "debit_card", "paypal", "crypto", "bank_transfer"]
 REGIONS         = ["North America", "Europe", "Asia", "South America", "Africa", "Oceania"]
 
-# Price ranges per category (min, max)
 PRICE_RANGE = {
     "Electronics":    (50.0,  2000.0),
     "Clothing":       (10.0,   300.0),
@@ -47,9 +36,7 @@ PRICE_RANGE = {
 print(f"Generating {N_ROWS:,} rows …")
 
 categories = rng.choice(CATEGORIES, size=N_ROWS)
-prices = np.array([
-    rng.uniform(*PRICE_RANGE[c]) for c in categories
-])
+prices = np.array([rng.uniform(*PRICE_RANGE[c]) for c in categories])
 
 df = pd.DataFrame({
     "user_id":        rng.integers(1, 50_001, size=N_ROWS),
@@ -67,5 +54,3 @@ df.to_csv(OUTPUT, index=False)
 
 size_mb = OUTPUT.stat().st_size / 1_048_576
 print(f"Saved → {OUTPUT}  ({N_ROWS:,} rows, {size_mb:.1f} MB)")
-print(df.dtypes)
-print(df.head(3))

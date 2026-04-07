@@ -1,202 +1,240 @@
 """
-compare_results.py
-──────────────────
-Reads results/experiment_results.json and produces comparison charts
-for all 4 experiments:
-  1dn_base | 1dn_opt | 3dn_base | 3dn_opt
+compare_results.py  —  plots for the 12-variant × 3-size × 2-cluster matrix
 
 Outputs:
-  results/comparison_total_time.png
-  results/comparison_peak_ram.png
-  results/comparison_steps.png
-  results/comparison_speedup.png
+  plot_time_vs_size.png        total time per variant across sizes
+  plot_speedup_heatmap.png     speedup vs baseline grid
+  plot_cache_order.png         cache post-filter vs pre-filter (order of ops)
+  plot_partition_strategies.png repartition vs coalesce vs aqe vs baseline
+  plot_step_breakdown.png      per-step stacked bar at 3M rows
 """
 
 import json
-import sys
 from pathlib import Path
+from collections import defaultdict
 
+import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mtick
-import numpy as np
 
 RESULTS_FILE = Path("results/experiment_results.json")
 OUT_DIR      = Path("results")
 
-EXP_ORDER  = ["1dn_base", "1dn_opt", "3dn_base", "3dn_opt"]
-EXP_LABELS = {
-    "1dn_base": "1 DN\nBaseline",
-    "1dn_opt":  "1 DN\nOptimized",
-    "3dn_base": "3 DN\nBaseline",
-    "3dn_opt":  "3 DN\nOptimized",
-}
-COLORS = {
-    "1dn_base": "#4C72B0",
-    "1dn_opt":  "#55A868",
-    "3dn_base": "#C44E52",
-    "3dn_opt":  "#8172B2",
-}
-
-STEP_ORDER = [
-    "1_load_count",
-    "1_load_repartition",
-    "2_feature_engineering",
-    "2_feature_engineering_cached",
-    "3_filter",
-    "3_broadcast_join",
-    "4_groupby_agg",
-    "5_window_rank",
-    "6_write_hdfs",
+SIZES    = ["100k", "1M", "3M"]
+CLUSTERS = ["1dn", "3dn"]
+VARIANTS = [
+    "baseline",
+    "cache",
+    "cache_prefilter",
+    "broadcast",
+    "repartition",
+    "coalesce",
+    "aqe",
+    "cache_broadcast",
+    "cache_coalesce",
+    "all_repart",
+    "all_coalesce",
+    "all_aqe",
 ]
-STEP_DISPLAY = {
-    "1_load_count":                   "Load + Count",
-    "1_load_repartition":             "Load + Repartition",
-    "2_feature_engineering":          "Feature Eng.",
-    "2_feature_engineering_cached":   "Feature Eng.\n(cached)",
-    "3_filter":                       "Filter",
-    "3_broadcast_join":               "Broadcast Join",
-    "4_groupby_agg":                  "GroupBy Agg.",
-    "5_window_rank":                  "Window Rank",
-    "6_write_hdfs":                   "Write HDFS",
+
+COLORS = {
+    "baseline":        "#4C72B0",
+    "cache":           "#55A868",
+    "cache_prefilter": "#C44E52",
+    "broadcast":       "#8172B2",
+    "repartition":     "#E88C30",
+    "coalesce":        "#F0C040",
+    "aqe":             "#CCB974",
+    "cache_broadcast": "#3A9E8C",
+    "cache_coalesce":  "#A0C878",
+    "all_repart":      "#D46060",
+    "all_coalesce":    "#8BC34A",
+    "all_aqe":         "#5E9ED6",
+}
+MARKERS = {
+    "baseline":        "o",
+    "cache":           "s",
+    "cache_prefilter": "X",
+    "broadcast":       "D",
+    "repartition":     "^",
+    "coalesce":        "v",
+    "aqe":             "p",
+    "cache_broadcast": "P",
+    "cache_coalesce":  "h",
+    "all_repart":      "*",
+    "all_coalesce":    "H",
+    "all_aqe":         "8",
 }
 
-# ── Load data ────────────────────────────────────────────────────────────────
-if not RESULTS_FILE.exists():
-    print(f"ERROR: {RESULTS_FILE} not found. Run all experiments first.")
-    sys.exit(1)
+SIZE_X         = {"100k": 0, "1M": 1, "3M": 2}
+SIZE_LABELS    = ["100k\n(~10 MB)", "1M\n(~100 MB)", "3M\n(~300 MB)"]
+CLUSTER_LABELS = {"1dn": "1 DataNode", "3dn": "3 DataNodes"}
+STEPS          = ["1_load", "2_features", "3_filter", "4_join",
+                  "5_groupby", "6_window_rank", "7_write"]
+STEP_COLORS    = ["#4878CF", "#6ACC65", "#D65F5F", "#B47CC7",
+                  "#C4AD66", "#77BEDB", "#aaa"]
+
+plt.rcParams.update({
+    "figure.facecolor":  "white",
+    "axes.facecolor":    "#f8f9f9",
+    "axes.grid":         True,
+    "grid.alpha":        0.4,
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+    "font.size":         10,
+})
 
 with open(RESULTS_FILE) as f:
     raw = json.load(f)
 
-# If multiple runs of same experiment exist, take the latest
-data: dict = {}
+data = defaultdict(lambda: defaultdict(dict))
 for entry in raw:
-    exp = entry["experiment"]
-    data[exp] = entry   # later entries overwrite earlier
+    parts = entry["experiment"].split("_")
+    if len(parts) < 3:
+        continue
+    size, cluster = parts[0], parts[1]
+    data[size][cluster]["_".join(parts[2:])] = entry
 
-missing = [e for e in EXP_ORDER if e not in data]
-if missing:
-    print(f"WARNING: missing experiments: {missing}")
-    print("Available:", list(data.keys()))
+def total(size, cluster, variant):
+    try:    return data[size][cluster][variant]["total_s"]
+    except: return None
 
-present = [e for e in EXP_ORDER if e in data]
+def step_t(size, cluster, variant, step):
+    try:    return data[size][cluster][variant]["checkpoints"][step]["elapsed_s"]
+    except: return 0.0
 
-def bar_labels(ax, bars, fmt="{:.1f}"):
-    for bar in bars:
-        h = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width() / 2, h + h * 0.02,
-                fmt.format(h), ha="center", va="bottom", fontsize=9, fontweight="bold")
+def focused_plot(fig, axes, variants, annotate=True):
+    for ax, cluster in zip(axes, CLUSTERS):
+        for v in variants:
+            pts = [(SIZE_X[s], total(s, cluster, v))
+                   for s in SIZES if total(s, cluster, v) is not None]
+            if not pts:
+                continue
+            xs, ys = zip(*pts)
+            ax.plot(xs, ys, marker=MARKERS[v], color=COLORS[v],
+                    label=v, linewidth=2.5, markersize=9)
+            if annotate:
+                for x, y in zip(xs, ys):
+                    ax.annotate(f"{y:.1f}s", xy=(x, y), xytext=(0, 8),
+                                textcoords="offset points",
+                                fontsize=8, ha="center", color=COLORS[v])
+        ax.set_title(CLUSTER_LABELS[cluster], fontweight="bold")
+        ax.set_xticks(list(SIZE_X.values()))
+        ax.set_xticklabels(SIZE_LABELS)
+        ax.set_ylabel("Total time (s)")
+        ax.legend(fontsize=9)
 
-plt.rcParams.update({
-    "figure.facecolor": "white",
-    "axes.facecolor":   "#f8f8f8",
-    "axes.grid":        True,
-    "grid.alpha":       0.4,
-    "axes.spines.top":  False,
-    "axes.spines.right":False,
-    "font.size":        11,
-})
+#  Plot 1 — Total time vs dataset size (all variants)
 
-# ════════════════════════════════════════════════════════════════════════════
-#  Plot 1: Total execution time
-# ════════════════════════════════════════════════════════════════════════════
-fig, ax = plt.subplots(figsize=(8, 5))
-xs      = np.arange(len(present))
-bars    = ax.bar(
-    xs,
-    [data[e]["total_s"] for e in present],
-    color=[COLORS[e] for e in present],
-    width=0.55, edgecolor="white", linewidth=1.2
-)
-bar_labels(ax, bars, "{:.1f}s")
-ax.set_xticks(xs)
-ax.set_xticklabels([EXP_LABELS[e] for e in present])
-ax.set_ylabel("Total time (seconds)")
-ax.set_title("Total Execution Time — 4 Experiments", fontweight="bold", pad=12)
+fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+fig.suptitle("Total Execution Time vs Dataset Size", fontweight="bold", fontsize=13)
+
+for ax, cluster in zip(axes, CLUSTERS):
+    for v in VARIANTS:
+        pts = [(SIZE_X[s], total(s, cluster, v))
+               for s in SIZES if total(s, cluster, v) is not None]
+        if not pts:
+            continue
+        xs, ys = zip(*pts)
+        ax.plot(xs, ys, marker=MARKERS[v], color=COLORS[v],
+                label=v, linewidth=2, markersize=7)
+        ax.annotate(f"{ys[-1]:.0f}s", xy=(xs[-1], ys[-1]),
+                    xytext=(4, 0), textcoords="offset points",
+                    fontsize=7, color=COLORS[v])
+    ax.set_title(CLUSTER_LABELS[cluster], fontweight="bold")
+    ax.set_xticks(list(SIZE_X.values()))
+    ax.set_xticklabels(SIZE_LABELS)
+    ax.set_ylabel("Total time (s)")
+    ax.legend(fontsize=7, loc="upper left", ncol=2)
+
 plt.tight_layout()
-fig.savefig(OUT_DIR / "comparison_total_time.png", dpi=150)
-print("Saved: comparison_total_time.png")
+fig.savefig(OUT_DIR / "plot_time_vs_size.png", dpi=150)
+print("Saved: plot_time_vs_size.png")
 
-# ════════════════════════════════════════════════════════════════════════════
-#  Plot 2: Peak RAM
-# ════════════════════════════════════════════════════════════════════════════
-fig, ax = plt.subplots(figsize=(8, 5))
-bars    = ax.bar(
-    xs,
-    [data[e]["peak_ram_mb"] for e in present],
-    color=[COLORS[e] for e in present],
-    width=0.55, edgecolor="white", linewidth=1.2
-)
-bar_labels(ax, bars, "{:.0f} MB")
-ax.set_xticks(xs)
-ax.set_xticklabels([EXP_LABELS[e] for e in present])
-ax.set_ylabel("Peak driver RAM (MB)")
-ax.set_title("Peak Memory Usage — 4 Experiments", fontweight="bold", pad=12)
+#  Plot 2 — Speedup heatmap
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+fig.suptitle("Speedup vs Baseline", fontweight="bold", fontsize=13)
+
+for ax, cluster in zip(axes, CLUSTERS):
+    matrix = np.array([
+        [( total(s, cluster, "baseline") or 0) / (total(s, cluster, v) or float("inf"))
+         if total(s, cluster, v) else np.nan
+         for s in SIZES]
+        for v in VARIANTS
+    ])
+    im = ax.imshow(matrix, aspect="auto", cmap="RdYlGn", vmin=0.5, vmax=2.0)
+    ax.set_xticks(range(len(SIZES)))
+    ax.set_xticklabels(SIZE_LABELS, fontsize=9)
+    ax.set_yticks(range(len(VARIANTS)))
+    ax.set_yticklabels(VARIANTS, fontsize=9)
+    ax.set_title(CLUSTER_LABELS[cluster], fontweight="bold")
+    for i in range(len(VARIANTS)):
+        for j in range(len(SIZES)):
+            v = matrix[i, j]
+            if not np.isnan(v):
+                ax.text(j, i, f"{v:.2f}×", ha="center", va="center", fontsize=8,
+                        color="black" if 0.65 < v < 1.6 else "white")
+    plt.colorbar(im, ax=ax)
+
 plt.tight_layout()
-fig.savefig(OUT_DIR / "comparison_peak_ram.png", dpi=150)
-print("Saved: comparison_peak_ram.png")
+fig.savefig(OUT_DIR / "plot_speedup_heatmap.png", dpi=150)
+print("Saved: plot_speedup_heatmap.png")
 
-# ════════════════════════════════════════════════════════════════════════════
-#  Plot 3: Per-step timing heatmap
-# ════════════════════════════════════════════════════════════════════════════
-# Collect step timings — some steps only exist in base, some only in opt
-all_step_keys = []
-for e in present:
-    for k in data[e]["checkpoints"]:
-        if k not in all_step_keys:
-            all_step_keys.append(k)
+#  Plot 3 — Cache placement (order of operations)
 
-matrix = []
-for e in present:
-    row = [data[e]["checkpoints"].get(k, {}).get("elapsed_s", 0) for k in all_step_keys]
-    matrix.append(row)
-matrix = np.array(matrix)
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+fig.suptitle("Cache Placement: Post-filter vs Pre-filter",
+             fontweight="bold", fontsize=12)
+focused_plot(fig, axes, ["baseline", "cache", "cache_prefilter"])
+fig.text(0.5, 0.01,
+         "cache = persists filtered DF  |  cache_prefilter = persists full featured DF",
+         ha="center", fontsize=9, style="italic", color="#555")
+plt.tight_layout(rect=[0, 0.05, 1, 1])
+fig.savefig(OUT_DIR / "plot_cache_order.png", dpi=150)
+print("Saved: plot_cache_order.png")
 
-fig, ax = plt.subplots(figsize=(max(10, len(all_step_keys) * 1.3), 4.5))
-im = ax.imshow(matrix, aspect="auto", cmap="YlOrRd")
-ax.set_xticks(range(len(all_step_keys)))
-ax.set_xticklabels([STEP_DISPLAY.get(k, k) for k in all_step_keys],
-                    rotation=35, ha="right", fontsize=9)
-ax.set_yticks(range(len(present)))
-ax.set_yticklabels([EXP_LABELS[e] for e in present])
-for i in range(len(present)):
-    for j in range(len(all_step_keys)):
-        v = matrix[i, j]
-        ax.text(j, i, f"{v:.1f}s" if v else "—", ha="center", va="center",
-                fontsize=8, color="black" if v < matrix.max() * 0.6 else "white")
-plt.colorbar(im, ax=ax, label="seconds")
-ax.set_title("Per-Step Timing Heatmap", fontweight="bold", pad=12)
+#  Plot 4 — Partition strategies: repartition vs coalesce vs AQE
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+fig.suptitle("Partition Strategies: Repartition vs Coalesce vs AQE",
+             fontweight="bold", fontsize=12)
+focused_plot(fig, axes, ["baseline", "repartition", "coalesce", "aqe"])
 plt.tight_layout()
-fig.savefig(OUT_DIR / "comparison_steps.png", dpi=150)
-print("Saved: comparison_steps.png")
+fig.savefig(OUT_DIR / "plot_partition_strategies.png", dpi=150)
+print("Saved: plot_partition_strategies.png")
 
-# ════════════════════════════════════════════════════════════════════════════
-#  Plot 4: Speedup ratios (relative to 1dn_base)
-# ════════════════════════════════════════════════════════════════════════════
-if "1dn_base" in data:
-    base_time = data["1dn_base"]["total_s"]
-    speedups  = {e: base_time / data[e]["total_s"] for e in present}
-    fig, ax   = plt.subplots(figsize=(8, 5))
-    bars = ax.bar(
-        xs,
-        [speedups[e] for e in present],
-        color=[COLORS[e] for e in present],
-        width=0.55, edgecolor="white", linewidth=1.2
-    )
-    ax.axhline(1.0, color="gray", linestyle="--", linewidth=1, label="Baseline (1×)")
-    bar_labels(ax, bars, "{:.2f}×")
-    ax.set_xticks(xs)
-    ax.set_xticklabels([EXP_LABELS[e] for e in present])
-    ax.set_ylabel("Speedup (×) vs. 1 DN Baseline")
-    ax.set_title("Speedup Relative to 1 DN Baseline", fontweight="bold", pad=12)
-    ax.legend()
-    plt.tight_layout()
-    fig.savefig(OUT_DIR / "comparison_speedup.png", dpi=150)
-    print("Saved: comparison_speedup.png")
+#  Plot 5 — Per-step breakdown at 3M rows
 
-print("\n── Summary ─────────────────────────────────────────────────────")
-for e in present:
-    d = data[e]
-    print(f"  {e:<12}  total={d['total_s']:6.2f}s  peak_ram={d['peak_ram_mb']:6.0f} MB")
+fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+fig.suptitle("Per-Step Breakdown — 3M rows", fontweight="bold", fontsize=13)
+
+for ax, cluster in zip(axes, CLUSTERS):
+    x      = np.arange(len(VARIANTS))
+    bottom = np.zeros(len(VARIANTS))
+    for step, color in zip(STEPS, STEP_COLORS):
+        heights = np.array([step_t("3M", cluster, v, step) for v in VARIANTS])
+        ax.bar(x, heights, bottom=bottom, color=color, label=step, width=0.65)
+        bottom += heights
+    for i, v in enumerate(VARIANTS):
+        t = total("3M", cluster, v)
+        if t:
+            ax.text(i, bottom[i] + 0.2, f"{t:.0f}s",
+                    ha="center", fontsize=8, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels(VARIANTS, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("Time (s)")
+    ax.set_title(CLUSTER_LABELS[cluster], fontweight="bold")
+    ax.legend(fontsize=7, loc="upper right")
+
+plt.tight_layout()
+fig.savefig(OUT_DIR / "plot_step_breakdown.png", dpi=150)
+print("Saved: plot_step_breakdown.png")
+
+#  Summary table
+print("\n── Summary ──────────────────────────────────────────────────────────")
+print(f"  {'experiment':<35}  {'total_s':>8}  {'peak_ram_mb':>12}")
+for entry in sorted(raw, key=lambda e: e["experiment"]):
+    print(f"  {entry['experiment']:<35}  {entry['total_s']:>8.2f}s  "
+          f"{entry['peak_ram_mb']:>10.0f} MB")

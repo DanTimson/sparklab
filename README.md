@@ -4,11 +4,16 @@ Distributed data processing experiment comparing HDFS cluster configurations (1 
 
 ---
 
-## Environment
+## Requirements
 
 - Docker Desktop with WSL2 integration enabled
-- Ubuntu 24.04 on WSL2
-- Python 3.12 + venv
+- Python 3.12 with `pandas`, `numpy`, `matplotlib` installed locally (for dataset generation and plot rendering)
+
+```bash
+pip install -r requirements.txt
+```
+
+Everything else runs inside the `spark-client` Docker container.
 
 ---
 
@@ -42,44 +47,52 @@ python data/generate_dataset.py 1000000   # generates data/transactions.csv
 | NameNode memory | 1 GB | 1 GB |
 | DataNode memory | 1 GB | 768 MB × 3 |
 
+---
+
 ## Spark pipeline (`spark_app_conf.py`)
 
-Seven steps, each timed independently:
+Nine timed checkpoints. Cache steps only appear in their respective variants.
 
-| Step | Operation |
-|------|-----------|
-| 1 | Load CSV from HDFS |
-| 2 | Feature engineering (`revenue`, `price_bucket`) |
-| 3 | Filter `discount > 0.1` |
-| 4 | Join category metadata table |
-| 5 | GroupBy aggregation per category × region |
-| 6 | Window rank by revenue within category |
-| 7 | Write aggregation result to HDFS |
+| Checkpoint | Operation |
+|---|---|
+| `1_load` | Read CSV from HDFS |
+| `2_features` | Feature engineering (`revenue`, `price_bucket`) |
+| `2_cache_prefilter` | *(prefilter variant only)* Materialise cache of full featured DF |
+| `3_filter` | Filter `discount > 0.1` + optional repartition/coalesce |
+| `3_cache` | *(cache variant only)* Materialise cache of filtered DF |
+| `4_join` | Join category metadata (broadcast or shuffle) |
+| `5_groupby` | GroupBy aggregation per category × region |
+| `6_window_rank` | Window rank by revenue within category |
+| `7_write` | Write aggregation result to HDFS |
+
+Steps 5 and 6 both read the filtered DF, making them the primary beneficiaries of caching.
+
+### Memory tracking
+
+JVM heap is sampled at each checkpoint via `Runtime.getRuntime()`. This reflects actual Spark memory usage (shuffle buffers, cached data, sort spill) rather than the Python process RSS which is a ~90 MB constant (Py4J wrapper overhead).
 
 ### Optimization flags
 
-All flags are off by default (baseline). Combinations are composed freely.
-
 | Flag | Effect |
 |------|--------|
-| `--cache` | `.cache()` filtered DF after step 3 – steps 5 and 6 read from memory |
-| `--cache-prefilter` | `.cache()` before filter – used as order-of-ops contrast |
-| `--broadcast` | `F.broadcast()` on metadata join – eliminates shuffle for small table |
+| `--cache` | Materialise filtered DF into memory; steps 5 and 6 skip HDFS re-scan |
+| `--cache-prefilter` | Cache before filter — larger DF persisted; order-of-ops contrast |
+| `--broadcast` | `F.broadcast()` on metadata join — no shuffle for small table |
 | `--repartition N` | Full shuffle to N partitions after filter |
-| `--coalesce N` | Merge to N partitions after filter, no shuffle |
-| `--aqe` | Adaptive Query Execution – reactive partition coalescing post-shuffle |
+| `--coalesce N` | Merge-only reduction to N partitions, no shuffle |
+| `--aqe` | Adaptive Query Execution — reactive partition coalescing |
 
-`--repartition` and `--aqe` are run in separate experiments as they both manage shuffle partition count.
+`--repartition` and `--aqe` target the same problem from opposite directions and are kept in separate experiments.
 
 ---
 
 ## Experiment matrix
 
-**72 experiments total:** 3 sizes × 2 clusters × 12 variants
+**72 experiments:** 3 sizes × 2 clusters × 12 variants
 
 | Variant | Flags |
 |---------|-------|
-| `baseline` | – |
+| `baseline` | — |
 | `cache` | `--cache` |
 | `cache_prefilter` | `--cache-prefilter` |
 | `broadcast` | `--broadcast` |
@@ -96,12 +109,27 @@ All flags are off by default (baseline). Combinations are composed freely.
 
 ## Running
 
+### Full matrix (~60–120 min)
+
 ```bash
 rm -f results/experiment_results.json
 bash run_all.sh
 ```
 
-### Regenerate plots from existing results
+### Manual single experiment
+
+```bash
+docker exec spark-client spark-submit \
+  --master local[*] \
+  --driver-memory 1g \
+  --conf "spark.driver.extraJavaOptions=-Dlog4j.configuration=file:/app/config/log4j.properties" \
+  /app/spark/spark_app_conf.py \
+  --hdfs hdfs://namenode:9000 \
+  --label 3M_1dn_cache_broadcast \
+  --cache --broadcast
+```
+
+### Regenerate plots only
 
 ```bash
 python results/compare_results.py
@@ -111,17 +139,17 @@ python results/compare_results.py
 
 ## Results
 
-After a full run, `results/` contains:
-
 | File | Description |
 |------|-------------|
 | `experiment_results.json` | Raw timing and RAM data for all experiments |
 | `spark_run.log` | Full Spark log across all runs |
-| `plot_time_vs_size.png` | Total execution time per variant across dataset sizes |
-| `plot_speedup_heatmap.png` | Speedup vs baseline grid (variant × size) |
-| `plot_cache_order.png` | Cache placement effect: post-filter vs pre-filter |
-| `plot_partition_strategies.png` | Repartition vs coalesce vs AQE vs baseline |
+| `plot_time_vs_size.png` | Total execution time per variant across sizes |
+| `plot_speedup_heatmap.png` | Speedup vs baseline (variant × size) |
+| `plot_cache_order.png` | Cache placement: post-filter vs pre-filter |
+| `plot_partition_strategies.png` | Repartition vs coalesce vs AQE |
 | `plot_step_breakdown.png` | Per-step stacked bar at 3M rows |
+| `plot_ram_peak.png` | Peak JVM heap per variant across sizes |
+| `plot_ram_cache_effect.png` | JVM heap per checkpoint showing cache materialisation jump |
 
 ### Plots
 
@@ -137,7 +165,40 @@ After a full run, `results/` contains:
 **Partition strategies**
 ![Partition strategies](results/plot_partition_strategies.png)
 
-**Per-step breakdown at 3M rows**
+**Per-step breakdown — 3M rows**
 ![Step breakdown](results/plot_step_breakdown.png)
 
+**Peak JVM heap across sizes**
+![RAM peak](results/plot_ram_peak.png)
+
+**JVM heap per checkpoint — cache materialisation effect**
+![RAM cache effect](results/plot_ram_cache_effect.png)
+
 ---
+
+## Troubleshooting
+
+**NameNode stays in safe mode**
+```bash
+docker exec namenode hdfs dfsadmin -safemode leave
+```
+
+**DataNodes not registering**
+```bash
+docker exec namenode hdfs dfsadmin -report
+# 3DN cluster needs ~75s after compose up
+```
+
+**Row count at `1_load` doesn't match generate_dataset.py**
+HDFS upload was interrupted — the `._COPYING_` suffix file was promoted. Re-upload:
+```bash
+docker exec namenode hdfs dfs -rm -f /data/transactions.csv
+docker cp data/transactions.csv namenode:/tmp/transactions.csv
+docker exec namenode hdfs dfs -put /tmp/transactions.csv /data/transactions.csv
+```
+
+**Port 9000 already in use**
+```bash
+ss -tlnp | grep 9000
+docker compose -f docker/1dn/docker-compose.yml down -v
+```

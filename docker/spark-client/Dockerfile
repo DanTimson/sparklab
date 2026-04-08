@@ -1,4 +1,3 @@
-# eclipse-temurin:17-jdk-noble = Ubuntu 22.04 + Java 17, official image
 FROM eclipse-temurin:17-jdk-noble
 
 RUN apt-get update && \
@@ -7,6 +6,8 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+RUN pip install --no-cache-dir --break-system-packages pyspark==3.5.1
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt

@@ -1,24 +1,23 @@
 """
 Flags (all off by default):
-  --cache            cache after filter
-  --cache-prefilter  cache before filter
+  --cache            cache filtered DF after filter
+  --cache-prefilter  cache before filter (larger DF — order-of-ops contrast)
   --broadcast        broadcast-join metadata table instead of shuffle join
   --repartition N    full shuffle to N partitions after filter
   --coalesce N       merge to N partitions after filter, no shuffle
   --aqe              enable Adaptive Query Execution
 
---repartition and --aqe are mutually exclusive.
+--repartition and --aqe are mutually exclusive by design: both control
+shuffle partition count, AQE reactively vs repartition upfront.
 """
 
 import time
 import json
 import logging
-import os
 import argparse
 from datetime import datetime
 from pathlib import Path
 
-import psutil
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
@@ -58,13 +57,17 @@ logging.basicConfig(
 )
 log = logging.getLogger("SparkLab")
 
-def get_ram_mb():
-    return psutil.Process(os.getpid()).memory_info().rss / 1_048_576
+def get_jvm_heap_mb():
+    # Runtime.getRuntime() queries the JVM heap directly.
+    # Python-side psutil would only see the Py4J wrapper (~90 MB constant).
+    rt = spark._jvm.Runtime.getRuntime()
+    return (rt.totalMemory() - rt.freeMemory()) / 1_048_576
 
 def checkpoint(label, t0, metrics):
     elapsed = time.perf_counter() - t0
-    log.info(f"[CHECKPOINT] {label:<42}  elapsed={elapsed:7.2f}s  RAM={get_ram_mb():7.1f} MB")
-    metrics[label] = {"elapsed_s": round(elapsed, 3), "ram_mb": round(get_ram_mb(), 1)}
+    ram     = get_jvm_heap_mb()
+    log.info(f"[CHECKPOINT] {label:<42}  elapsed={elapsed:7.2f}s  JVM heap={ram:7.1f} MB")
+    metrics[label] = {"elapsed_s": round(elapsed, 3), "ram_mb": round(ram, 1)}
 
 def save_results(metrics, total_s):
     RESULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -89,13 +92,14 @@ def save_results(metrics, total_s):
         json.dump(existing, f, indent=2)
     log.info(f"Saved → {RESULTS_FILE}  total={total_s:.2f}s")
 
-# ── Spark session ─────────────────────────────────────────────────────────────
+# Spark session
 log.info(f"Experiment : {EXP_LABEL}")
 log.info(f"Opts active: { {k: v for k, v in opts.items() if v} }")
 
 builder = (
     SparkSession.builder
     .appName(f"SparkLab_{EXP_LABEL}")
+    # Disable auto-broadcast so join strategy is controlled by --broadcast flag
     .config("spark.sql.autoBroadcastJoinThreshold", "-1")
     .config("spark.sql.adaptive.enabled", "true" if args.aqe else "false")
 )
@@ -115,7 +119,6 @@ t_global = time.perf_counter()
 df_cached = None
 
 #  STEP 1 — Load
-
 log.info("── STEP 1: Load")
 t0 = time.perf_counter()
 
@@ -125,7 +128,6 @@ checkpoint("1_load", t0, metrics)
 log.info(f"  Rows: {row_count:,}")
 
 #  STEP 2 — Feature engineering
-
 log.info("── STEP 2: Feature engineering")
 t0 = time.perf_counter()
 
@@ -138,17 +140,19 @@ df_featured = (
                                  .when(F.col("price") < 300, "mid")
                                  .otherwise("high"))
 )
-
-if args.cache_prefilter:
-    df_featured = df_featured.cache()
-    df_cached   = df_featured
-
-pre_count = df_featured.count()
+df_featured.count()
 checkpoint("2_features", t0, metrics)
-log.info(f"  Rows: {pre_count:,}")
+
+# ── Cache pre-filter ────────────────────────────────
+if args.cache_prefilter:
+    log.info("── STEP 2c: Cache pre-filter")
+    t0 = time.perf_counter()
+    df_featured = df_featured.cache()
+    df_featured.count()
+    df_cached = df_featured
+    checkpoint("2_cache_prefilter", t0, metrics)
 
 #  STEP 3 — Filter
-
 log.info("── STEP 3: Filter")
 t0 = time.perf_counter()
 
@@ -159,16 +163,20 @@ if args.repartition > 0:
 elif args.coalesce > 0:
     df = df.coalesce(args.coalesce)
 
-if args.cache:
-    df        = df.cache()
-    df_cached = df
-
-filtered_count = df.count()
+df.count()
 checkpoint("3_filter", t0, metrics)
-log.info(f"  Filtered rows: {filtered_count:,}")
+log.info(f"  Partitions: {df.rdd.getNumPartitions()}")
+
+# Cache post-filter
+if args.cache:
+    log.info("── STEP 3c: Cache post-filter")
+    t0 = time.perf_counter()
+    df       = df.cache()
+    df.count()
+    df_cached = df
+    checkpoint("3_cache", t0, metrics)
 
 #  STEP 4 — Metadata join
-
 log.info(f"── STEP 4: Join ({'broadcast' if args.broadcast else 'shuffle'})")
 t0 = time.perf_counter()
 
@@ -192,7 +200,6 @@ df_enriched.count()
 checkpoint("4_join", t0, metrics)
 
 #  STEP 5 — GroupBy aggregation
-
 log.info("── STEP 5: GroupBy")
 t0 = time.perf_counter()
 
@@ -211,7 +218,6 @@ df_agg.count()
 checkpoint("5_groupby", t0, metrics)
 
 #  STEP 6 — Window rank
-
 log.info("── STEP 6: Window rank")
 t0 = time.perf_counter()
 
@@ -220,7 +226,6 @@ df.withColumn("rank_in_cat", F.rank().over(w)).filter(F.col("rank_in_cat") <= 3)
 checkpoint("6_window_rank", t0, metrics)
 
 #  STEP 7 — Write
-
 log.info("── STEP 7: Write")
 t0 = time.perf_counter()
 
